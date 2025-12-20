@@ -20,7 +20,6 @@ use db::{
         project_repo::ProjectRepo,
         repo::Repo,
         scratch::{DraftFollowUpData, Scratch, ScratchType},
-        session::{CreateSession, Session},
         task::{Task, TaskStatus},
         workspace::Workspace,
         workspace_repo::WorkspaceRepo,
@@ -736,19 +735,75 @@ impl LocalContainerService {
         Ok(())
     }
 
+    /// Create workspace-level CLAUDE.md and AGENTS.md files that import from each repo.
+    /// Uses the @import syntax to reference each repo's config files.
+    /// Skips creating files if they already exist or if no repos have the source file.
+    async fn create_workspace_config_files(
+        workspace_dir: &Path,
+        repos: &[Repo],
+    ) -> Result<(), ContainerError> {
+        const CONFIG_FILES: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
+
+        for config_file in CONFIG_FILES {
+            let workspace_config_path = workspace_dir.join(config_file);
+
+            if workspace_config_path.exists() {
+                tracing::debug!(
+                    "Workspace config file {} already exists, skipping",
+                    config_file
+                );
+                continue;
+            }
+
+            let mut import_lines = Vec::new();
+            for repo in repos {
+                let repo_config_path = workspace_dir.join(&repo.name).join(config_file);
+                if repo_config_path.exists() {
+                    import_lines.push(format!("@{}/{}", repo.name, config_file));
+                }
+            }
+
+            if import_lines.is_empty() {
+                tracing::debug!(
+                    "No repos have {}, skipping workspace config creation",
+                    config_file
+                );
+                continue;
+            }
+
+            let content = import_lines.join("\n") + "\n";
+            if let Err(e) = tokio::fs::write(&workspace_config_path, &content).await {
+                tracing::warn!(
+                    "Failed to create workspace config file {}: {}",
+                    config_file,
+                    e
+                );
+                continue;
+            }
+
+            tracing::info!(
+                "Created workspace {} with {} import(s)",
+                config_file,
+                import_lines.len()
+            );
+        }
+
+        Ok(())
+    }
+
     /// Start a follow-up execution from a queued message
     async fn start_queued_follow_up(
         &self,
         ctx: &ExecutionContext,
         queued_data: &DraftFollowUpData,
     ) -> Result<ExecutionProcess, ContainerError> {
-        // Get executor profile from the latest CodingAgent process
-        let initial_executor_profile_id = ExecutionProcess::latest_executor_profile_for_workspace(
-            &self.db.pool,
-            ctx.workspace.id,
-        )
-        .await
-        .map_err(|e| ContainerError::Other(anyhow!("Failed to get executor profile: {e}")))?;
+        // Get executor profile from the latest CodingAgent process in this session
+        let initial_executor_profile_id =
+            ExecutionProcess::latest_executor_profile_for_session(&self.db.pool, ctx.session.id)
+                .await
+                .map_err(|e| {
+                    ContainerError::Other(anyhow!("Failed to get executor profile: {e}"))
+                })?;
 
         let executor_profile_id = ExecutorProfileId {
             executor: initial_executor_profile_id.executor,
@@ -756,9 +811,9 @@ impl LocalContainerService {
         };
 
         // Get latest agent session ID for session continuity (from coding agent turns)
-        let latest_agent_session_id = ExecutionProcess::find_latest_agent_session_id_by_workspace(
+        let latest_agent_session_id = ExecutionProcess::find_latest_coding_agent_turn_session_id(
             &self.db.pool,
-            ctx.workspace.id,
+            ctx.session.id,
         )
         .await?;
 
@@ -766,35 +821,33 @@ impl LocalContainerService {
             ProjectRepo::find_by_project_id_with_names(&self.db.pool, ctx.project.id).await?;
         let cleanup_action = self.cleanup_actions_for_repos(&project_repos);
 
+        let working_dir = ctx
+            .workspace
+            .agent_working_dir
+            .as_ref()
+            .filter(|dir| !dir.is_empty())
+            .cloned();
+
         let action_type = if let Some(agent_session_id) = latest_agent_session_id {
             ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
                 prompt: queued_data.message.clone(),
                 session_id: agent_session_id,
                 executor_profile_id: executor_profile_id.clone(),
+                working_dir: working_dir.clone(),
             })
         } else {
             ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
                 prompt: queued_data.message.clone(),
                 executor_profile_id: executor_profile_id.clone(),
+                working_dir,
             })
         };
 
         let action = ExecutorAction::new(action_type, cleanup_action.map(Box::new));
 
-        // Create a new session for this follow-up
-        let session = Session::create(
-            &self.db.pool,
-            &CreateSession {
-                executor: Some(executor_profile_id.to_string()),
-            },
-            Uuid::new_v4(),
-            ctx.workspace.id,
-        )
-        .await?;
-
         self.start_execution(
             &ctx.workspace,
-            &session,
+            &ctx.session,
             &action,
             &ExecutionProcessRunReason::CodingAgent,
         )
@@ -890,6 +943,9 @@ impl ContainerService for LocalContainerService {
         self.copy_files_and_images(&created_workspace.workspace_dir, workspace)
             .await?;
 
+        Self::create_workspace_config_files(&created_workspace.workspace_dir, &repositories)
+            .await?;
+
         Workspace::update_container_ref(
             &self.db.pool,
             workspace.id,
@@ -949,6 +1005,8 @@ impl ContainerService for LocalContainerService {
         // Copy project files and images (fast no-op if already exist)
         self.copy_files_and_images(&workspace_dir, workspace)
             .await?;
+
+        Self::create_workspace_config_files(&workspace_dir, &repositories).await?;
 
         Ok(workspace_dir.to_string_lossy().to_string())
     }
