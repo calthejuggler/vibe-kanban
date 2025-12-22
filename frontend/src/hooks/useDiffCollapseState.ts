@@ -13,6 +13,7 @@ const DEFAULT_DIFF_COLLAPSE_DEFAULTS: DiffCollapseDefaults = {
 };
 
 const DEFAULT_COLLAPSE_MAX_LINES = 200;
+const DEFAULT_COLLAPSE_ALL_THRESHOLD = 50;
 
 const exceedsMaxLineCount = (diff: Diff, maxLines: number) => {
   if (diff.additions != null || diff.deletions != null) {
@@ -27,7 +28,8 @@ export const getDiffId = (diff: Diff, index: number) =>
 
 interface UseDiffCollapseStateOptions {
   collapseDefaults?: DiffCollapseDefaults;
-  maxLines?: number | null;
+  maxLines?: number;
+  collapseAllThreshold?: number;
 }
 
 export function useDiffCollapseState(
@@ -37,6 +39,7 @@ export function useDiffCollapseState(
   const {
     collapseDefaults = DEFAULT_DIFF_COLLAPSE_DEFAULTS,
     maxLines = DEFAULT_COLLAPSE_MAX_LINES,
+    collapseAllThreshold = DEFAULT_COLLAPSE_ALL_THRESHOLD,
   } = options;
 
   const [userCollapseOverrides, setUserCollapseOverrides] = useState<
@@ -46,8 +49,14 @@ export function useDiffCollapseState(
   const defaultCollapsedIds = useMemo(() => {
     const collapsed = new Set<string>();
 
+    const fileCountExceedsCollapseThreshold =
+      collapseAllThreshold != null &&
+      collapseAllThreshold > 0 &&
+      diffs.length > collapseAllThreshold;
+
     diffs.forEach((diff, index) => {
       const shouldCollapse =
+        fileCountExceedsCollapseThreshold ||
         collapseDefaults[diff.change] ||
         (maxLines && maxLines > 0 && exceedsMaxLineCount(diff, maxLines));
 
@@ -57,7 +66,7 @@ export function useDiffCollapseState(
     });
 
     return collapsed;
-  }, [diffs, collapseDefaults, maxLines]);
+  }, [diffs, collapseDefaults, maxLines, collapseAllThreshold]);
 
   const toggle = useCallback(
     (id: string) => {
